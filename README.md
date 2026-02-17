@@ -1,5 +1,9 @@
 # PyTerametrics
 
+[![PyPI version](https://badge.fury.io/py/pyterametrics.svg)](https://badge.fury.io/py/pyterametrics)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Versions](https://img.shields.io/pypi/pyversions/pyterametrics.svg)](https://pypi.org/project/pyterametrics/)
+
 Python port of [TerraMetrics](https://github.com/stilab-ets/terametrics) — IaC quality metrics for Terraform HCL files.
 
 Computes 100+ quality metrics at the block level for Terraform `.tf` files, including:
@@ -15,7 +19,7 @@ Computes 100+ quality metrics at the block level for Terraform `.tf` files, incl
 ## Installation
 
 ```bash
-pip install .
+pip install pyterametrics
 ```
 
 ## Usage
