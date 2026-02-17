@@ -56,7 +56,3 @@ uv sync
 # Run tests
 uv run pytest tests/ -v
 ```
-
-## License
-
-MIT

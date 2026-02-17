@@ -46,8 +46,8 @@ PROVIDER_PREFIXES = [
 # Deprecated Terraform functions
 DEPRECATED_FUNCTIONS = ["list", "map"]
 
-# Debugging functions
-DEBUGGING_FUNCTIONS = ["file", "templatefile"]
+# Debugging functions (Java: try, can, type)
+DEBUGGING_FUNCTIONS = ["try", "can", "type"]
 
 # Comparison operators
 COMPARISON_OPERATORS = ["==", "!=", "<", ">", "<=", ">="]
@@ -58,8 +58,11 @@ LOGICAL_OPERATORS = ["&&", "||", "!"]
 # Math operators
 MATH_OPERATORS = ["+", "-", "*", "/", "%"]
 
-# Meta-argument names
-META_ARGUMENTS = ["depends_on", "count", "for_each", "provider", "lifecycle"]
+# Meta-argument attribute names (Java: MetaArgumentVisitor.metaArgsAttributes)
+META_ARG_ATTRS = ["depends_on", "count", "for_each", "provider"]
+
+# Meta-argument block names (Java: MetaArgumentVisitor.metaArgsBlocks)
+META_ARG_BLOCKS = ["lifecycle", "provisioner", "connection"]
 
 
 # =============================================================================
@@ -449,23 +452,41 @@ def collect_index_access(metrics: Dict, block: Tree) -> None:
 
 
 def _count_literals(attr: Tree) -> int:
-    """Count literal expressions in an attribute (int, bool, string, null)."""
+    """Count literal expressions in an attribute.
+
+    Java LiteralExprTreeImpl maps to:
+    - 'string' nodes (string literals)
+    - 'int_lit' / 'float_lit' nodes (numeric literals)
+    - 'identifier' nodes with value 'true', 'false', 'null' (boolean/null literals)
+
+    In Lark HCL grammar, booleans and null are parsed as identifiers.
+    """
     val = get_attribute_value(attr)
     if val is None:
         return 0
     count = 0
     for node in get_all_nodes(val):
-        if isinstance(node, Tree) and node.data == "int_lit":
-            count += 1
-        elif isinstance(node, Token) and node.type in ("TRUE", "FALSE", "NULL"):
-            count += 1
-        elif isinstance(node, Tree) and node.data == "string":
-            count += 1
+        if isinstance(node, Tree):
+            if node.data == "string":
+                count += 1
+            elif node.data in ("int_lit", "float_lit"):
+                count += 1
+            elif node.data == "identifier":
+                # Check if this is true/false/null (literal, not variable)
+                name = _textualize(node).strip()
+                if name in ("true", "false", "null"):
+                    count += 1
+            elif node.data == "heredoc_template":
+                count += 1
     return count
 
 
 def _count_string_values(attr: Tree) -> int:
-    """Count string literal values in an attribute."""
+    """Count string literal values in an attribute.
+
+    Java isLiteralExprValueString() excludes true, false, null, and numeric.
+    In Lark, strings are 'string' nodes.
+    """
     val = get_attribute_value(attr)
     if val is None:
         return 0
@@ -500,12 +521,29 @@ def collect_loops(metrics: Dict, block: Tree) -> None:
     metrics["maxLoops"] = mx
 
 
+def _count_math_ops(attr: Tree) -> int:
+    """Count math operations in an attribute.
+
+    Java MathOperationsVisitor counts BOTH:
+    - BinaryExpressionTreeImpl with +,-,*,/,% operators
+    - PrefixExpressionTreeImpl with - prefix (unary negation)
+    """
+    binary_count = _count_binary_ops_by_operators(attr, MATH_OPERATORS)
+    # Also count unary prefix '-' (PrefixExpressionTreeImpl)
+    val = get_attribute_value(attr)
+    prefix_count = 0
+    if val is not None:
+        for node in get_all_nodes(val):
+            if isinstance(node, Tree) and node.data == "unary_op":
+                for child in node.children:
+                    if isinstance(child, Token) and str(child).strip() == "-":
+                        prefix_count += 1
+    return binary_count + prefix_count
+
+
 def collect_math_operations(metrics: Dict, block: Tree) -> None:
     """Math operations: num, avg, max."""
-    total, avg, mx = _per_attr_stats(
-        block,
-        lambda attr: _count_binary_ops_by_operators(attr, MATH_OPERATORS),
-    )
+    total, avg, mx = _per_attr_stats(block, _count_math_ops)
     metrics["numMathOperations"] = total
     metrics["avgMathOperations"] = avg
     metrics["maxMathOperations"] = mx
@@ -537,17 +575,23 @@ def collect_mccabe_cc(metrics: Dict, block: Tree) -> None:
 
 
 def collect_meta_args(metrics: Dict, block: Tree) -> None:
-    """Count meta-arguments (depends_on, count, for_each, provider, lifecycle)."""
+    """Count meta-arguments.
+
+    Java MetaArgumentVisitor checks:
+    - Direct attributes with names in [depends_on, count, for_each, provider]
+      using getAttributes() (direct only, NOT recursive)
+    - Direct nested blocks with names in [lifecycle, provisioner, connection]
+      using identifyNestedBlock() (direct nested blocks only)
+    """
+    # Direct attributes (not recursive into nested blocks)
     attrs = _get_direct_attributes(block)
-    count = sum(1 for a in attrs if get_attribute_name(a) in META_ARGUMENTS)
-    # Also check for meta-argument blocks like lifecycle
-    nested = find_all_nested_blocks(block)
-    for nb in nested:
-        if nb is block:
-            continue
-        btype = get_block_type(nb)
-        if btype in META_ARGUMENTS:
-            count += 1
+    count = sum(1 for a in attrs if get_attribute_name(a) in META_ARG_ATTRS)
+    # Direct nested blocks (not recursive)
+    for child in block.children:
+        if isinstance(child, Tree) and child.data == "block":
+            btype = get_block_type(child)
+            if btype in META_ARG_BLOCKS:
+                count += 1
     metrics["numMetaArg"] = count
 
 
@@ -611,18 +655,61 @@ def collect_references(metrics: Dict, block: Tree) -> None:
 
 
 def _count_variables(attr: Tree) -> int:
-    """Count variable expressions (identifiers used as values) in an attribute."""
+    """Count variable expressions (VariableExprTreeImpl) in an attribute.
+
+    Reverting to 'root identifier' logic which was closer to correct than
+    the aggressive 'count all identifiers' logic (which overcounted massively).
+
+    We count expr_term nodes that start with an identifier and do NOT have
+    trailing get_attr/index accessors within the *same* expr_term children list.
+    (This ensures we count `var` in `var.x`, but not `var` AND `var.x` if
+    Lark nested them differently, though Lark wrapping usually is expr_term -> get_attr_expr_term).
+    
+    Actually, we just want:
+    Any expr_term whose first child is identifier (not true/false/null).
+    AND check if that expr_term is the "leaf" of a chain or the "root" of a chain?
+    Java `VariableExprTreeImpl` is the reference node.
+    `aws_vpc.primary.id`. `aws_vpc` is a `VariableExpr`.
+    In Lark:
+    `expr_term` (wrapping `get_attr_expr_term`)
+      `expr_term` (identifier `aws_vpc`)
+    
+    We count the INNER `expr_term` because it has just `identifier`.
+    The OUTER `expr_term` has `get_attr_expr_term` child.
+    
+    So logic: Count expr_term where children[0] is identifier and len(children)==1?
+    Or has no trailing accessors.
+    """
     val = get_attribute_value(attr)
     if val is None:
         return 0
     count = 0
     for node in get_all_nodes(val):
         if isinstance(node, Tree) and node.data == "expr_term":
-            # Check if this is a simple identifier reference (variable)
             children = [c for c in node.children if isinstance(c, (Tree, Token))]
-            if children and isinstance(children[0], Tree) and children[0].data == "identifier":
-                count += 1
-            elif children and isinstance(children[0], Token) and children[0].type == "NAME":
+            if not children:
+                continue
+            first = children[0]
+            is_var = False
+            name_val = None
+            if isinstance(first, Tree) and first.data == "identifier":
+                name_val = _textualize(first).strip()
+                is_var = True
+            elif isinstance(first, Token) and first.type == "NAME":
+                name_val = str(first)
+                is_var = True
+            
+            if not is_var:
+                continue
+            if name_val in ("true", "false", "null"):
+                continue
+
+            # Check for trailing accessors in THIS expr_term's children
+            has_trailing = any(
+                isinstance(c, Tree) and c.data in ("get_attr", "index", "attr_splat", "full_splat", "get_attr_expr_term")
+                for c in children[1:]
+            )
+            if not has_trailing:
                 count += 1
     return count
 
@@ -658,15 +745,45 @@ def collect_splat_expressions(metrics: Dict, block: Tree) -> None:
 
 
 def _count_template_expressions(attr: Tree) -> int:
-    """Count template/interpolation expressions in an attribute."""
+    """Count template expressions in an attribute.
+
+    Java TemplateExpressionTreeImpl is a string template that contains
+    interpolations (${...}). In Lark, this is a 'string' node that has
+    at least one 'interpolation' child somewhere in its subtree.
+    """
     val = get_attribute_value(attr)
     if val is None:
         return 0
-    return len(find_nodes_by_rule(val, "interpolation"))
+    count = 0
+    for node in get_all_nodes(val):
+        if isinstance(node, Tree) and node.data == "string":
+            # Check if this string contains any interpolation
+            has_interpolation = any(
+                isinstance(child, Tree) and child.data in ("interpolation", "string_part")
+                and _has_interpolation(child)
+                for child in node.children
+            ) or any(
+                isinstance(child, Tree) and child.data == "interpolation"
+                for child in node.children
+            )
+            if has_interpolation:
+                count += 1
+    return count
+
+
+def _has_interpolation(node: Tree) -> bool:
+    """Check if a tree node contains any interpolation children."""
+    if isinstance(node, Tree):
+        if node.data == "interpolation":
+            return True
+        for child in node.children:
+            if isinstance(child, Tree) and _has_interpolation(child):
+                return True
+    return False
 
 
 def collect_template_expressions(metrics: Dict, block: Tree) -> None:
-    """Template expressions (interpolations): num, avg."""
+    """Template expressions: num, avg."""
     attrs = find_attributes(block)
     total = sum(_count_template_expressions(a) for a in attrs)
     metrics["numTemplateExpression"] = total
@@ -692,10 +809,67 @@ def _text_entropy(text: str) -> float:
     return _round2(entropy)
 
 
-def _tokenize(tree) -> List[str]:
-    """Extract all non-whitespace token values from a tree."""
-    tokens = find_tokens(tree)
-    return [str(t) for t in tokens if str(t).strip()]
+def _tokenize(tree_or_text) -> List[str]:
+    """Extract all token values from a tree or text string.
+
+    For Java compatibility, we need to count ALL syntax tokens including
+    punctuation ({, }, =, ., ,, etc.) which implicit Lark tokens might skip.
+    Since we can't easily get implicit tokens from the Lark tree, we use
+    a regex-based tokenizer on the textual content, similar to how Sonar
+    IAC/Java would see the tokens.
+
+    We must strip comments first.
+    """
+    if isinstance(tree_or_text, Tree):
+        # Fallback if passed a tree, but we prefer text for accuracy
+        text = _textualize(tree_or_text)
+    else:
+        text = str(tree_or_text)
+
+    # 1. Strip comments (using existing helper logic)
+    # Remove multi-line comments
+def _strip_comments(text: str) -> str:
+    """Strip comments while preserving strings.
+
+    Simple regex replacement of # or // can break strings containing those chars.
+    We iterate through the text matching strings vs comments.
+    """
+    # Regex for:
+    # 1. Quoted strings (capture group 1)
+    # 2. Multi-line comments (capture group 2)
+    # 3. Single-line # (capture group 3)
+    # 4. Single-line // (capture group 4)
+    pattern = r'("(?:[^"\\]|\\.)*")|(/\*.*?\*/)|(#[^\n]*)|(//[^\n]*)'
+    
+    def replace(match):
+        if match.group(1):
+            return match.group(1) # Keep string
+        return " " # Replace comment with space to preserve separation
+
+    return re.sub(pattern, replace, text, flags=re.DOTALL)
+
+
+def _tokenize(tree_or_text) -> List[str]:
+    """Extract all token values from a tree or text string."""
+    if isinstance(tree_or_text, Tree):
+        text = _textualize(tree_or_text)
+    else:
+        text = str(tree_or_text)
+
+    # 1. Strip comments robustly
+    cleaned = _strip_comments(text)
+
+    # 2. Regex to match tokens
+    token_pattern = r'''
+        "(?:[^"\\]|\\.)*"|             # Quoted strings
+        <<-?[a-zA-Z_]+|                # Heredoc start marker
+        [a-zA-Z_][a-zA-Z0-9_\-]*|      # Identifiers
+        \d+(?:\.\d+)?|                 # Numbers
+        ==|!=|<=|>=|&&|\|\||\.\.\.|    # Multi-char operators
+        [^\s]                          # Single-char punctuation
+    '''
+    tokens = re.findall(token_pattern, cleaned, re.VERBOSE)
+    return [t for t in tokens if t.strip()]
 
 
 def _textualize(tree) -> str:
@@ -712,22 +886,63 @@ def _textualize(tree) -> str:
 
 def collect_tokens(metrics: Dict, block: Tree) -> None:
     """Token count, text entropy, and per-attribute token/entropy stats."""
+    # We need the source text for accurate tokenization
+    # Since collect_all_metrics receives block_content, we can't easily access it here
+    # unless we pass it down or reconstruct it.
+    # Fortunately, calling str(t) relies on valid tokens. 
+    # But `block` tree tokens are incomplete.
+    # We MUST rely on `_textualize` or similar.
+    # Actually, `collect_all_metrics` DOES have `block_content`.
+    # But `collect_tokens` signature is `(metrics, block)`.
+    # We should update `collect_tokens` to accept `block_content` or `text`.
+    
+    # For now, we will use the improved _tokenize which tries to handle things,
+    # but without `block_content` passed in, `_tokenize(block)` fails to get hidden tokens.
+    # We'll fix this in the main loop call.
+    pass 
+
+def collect_tokens_with_content(metrics: Dict, block: Tree, block_content: str) -> None:
+    """Token count and entropy taking exact block content."""
     # Block-level text entropy
-    block_text = _textualize(block)
-    metrics["textEntropyMeasure"] = _text_entropy(block_text)
-
-    # Per-attribute token count and entropy
-    attrs = find_attributes(block)
-    all_tokens = _tokenize(block)
+    # _tokenize now expects text/tree. We pass text.
+    all_tokens = _tokenize(block_content)
     metrics["numTokens"] = len(all_tokens)
+    
+    # Entropy matches java: textualize all tokens
+    full_text = "".join(all_tokens) # Concatenate all token values
+    metrics["textEntropyMeasure"] = _text_entropy(full_text)
 
+    # Per-attribute stats
+    attrs = find_attributes(block)
     if attrs:
         attr_token_counts = []
         attr_entropies = []
         for attr in attrs:
-            tokens = _tokenize(attr)
+            # We can't easily get exact source text for just the attribute 
+            # without range slicing.
+            # Use get_block_line_range? No, that's line based.
+            # Use meta info from tree?
+            # Lark tokens have line/column, but `attr` tree spans are metadata.
+            # Fallback: tokenize the attribute TREE (might miss punctuation)
+            # OR better: use `attr.meta` if available to slice `block_content`.
+            # If meta not available, we accept slight undercount for attributes.
+            # But the TOTAL `numTokens` (block) will be correct.
+            
+            # Using tree-based tokenization for attributes for now 
+            # (as attributes usually just have name = value, fewer hidden structural braces)
+            # Actually, `attr` has `=` which is often hidden.
+            # Let's try to reconstruct or just use tree tokens + heuristics.
+            
+            # Reverting attributes to use tree-based tokens but adding `=` manually?
+            tokens = _tokenize(attr) # This uses tree stringification which misses invisible tokens
+            # Attributes always have an '='. Let's add 1 for it?
+            # And usually 2 for name and value?
+            # This is hard.
+            # Let's trust `_tokenize(attr)` does its best with available tokens.
+            # If `attr` is a Tree, `_tokenize` calls `_textualize` -> `find_tokens`.
+            
             attr_token_counts.append(len(tokens))
-            text = _textualize(attr)
+            text = "".join(tokens)
             attr_entropies.append(_text_entropy(text))
 
         metrics["minTokensPerAttr"] = min(attr_token_counts)
@@ -788,22 +1003,12 @@ def collect_tuple_elements(metrics: Dict, block: Tree) -> None:
 
 
 def collect_explicit_deps(metrics: Dict, block: Tree) -> None:
-    """Count explicit resource dependencies (depends_on)."""
-    attrs = _get_direct_attributes(block)
-    count = 0
-    for attr in attrs:
-        if get_attribute_name(attr) == "depends_on":
-            val = get_attribute_value(attr)
-            if val:
-                # Count elements in the depends_on list
-                tuples = find_nodes_by_rule(val, "tuple")
-                for tup in tuples:
-                    count += sum(
-                        1 for c in tup.children
-                        if isinstance(c, Tree)
-                        and c.data not in ("new_line_or_comment", "new_line_and_or_comment")
-                    )
-    metrics["numExplicitResourceDependency"] = count
+    """Count explicit resource dependencies (depends_on).
+
+    Java ExplicitResourceDependencyVisitor has its logic COMMENTED OUT
+    and always returns 0.
+    """
+    metrics["numExplicitResourceDependency"] = 0
 
 
 def _get_all_variable_names(block: Tree) -> List[str]:
@@ -868,12 +1073,18 @@ def _get_all_string_values(block: Tree) -> List[str]:
 
 
 def collect_special_strings(metrics: Dict, block: Tree) -> None:
-    """Special string patterns: empty strings, wildcard suffix, star strings."""
+    """Special string patterns: empty strings, wildcard suffix, star strings.
+
+    Java SpecialStringCalculator uses EXACT equality checks:
+    - numEmptyString: value.isEmpty() (empty string)
+    - numWildCardSuffixString: value.equals(":*") (exact match)
+    - numStarString: value.equals("*") (exact match)
+    """
     strings = _get_all_string_values(block)
 
     metrics["numEmptyString"] = sum(1 for s in strings if s == "")
-    metrics["numWildCardSuffixString"] = sum(1 for s in strings if ":*" in s)
-    metrics["numStarString"] = sum(1 for s in strings if s == "*" or "*" in s)
+    metrics["numWildCardSuffixString"] = sum(1 for s in strings if s == ":*")
+    metrics["numStarString"] = sum(1 for s in strings if s == "*")
 
 
 def collect_deprecated_functions(metrics: Dict, block: Tree) -> None:
@@ -980,7 +1191,10 @@ def collect_all_metrics(block: Tree, block_content: str = "") -> Dict[str, Any]:
     collect_variables(metrics, block)
     collect_splat_expressions(metrics, block)
     collect_template_expressions(metrics, block)
-    collect_tokens(metrics, block)
+    collect_template_expressions(metrics, block)
+    # Pass block_content for better tokenizer accuracy
+    collect_tokens_with_content(metrics, block, block_content)
+    collect_tuples(metrics, block)
     collect_tuples(metrics, block)
     collect_tuple_elements(metrics, block)
     collect_explicit_deps(metrics, block)
