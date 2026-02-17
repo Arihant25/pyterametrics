@@ -1,0 +1,26 @@
+[project]
+name = "pyterametrics"
+version = "0.1.0"
+description = "Python port of TerraMetrics — IaC quality metrics for Terraform HCL files"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Arihant Tripathy", email = "arihanttr@live.com" }
+]
+requires-python = ">=3.8"
+dependencies = [
+    "python-hcl2>=6.0.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+pyterametrics = "pyterametrics.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.22,<0.9.0"]
+build-backend = "uv_build"

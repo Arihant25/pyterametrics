@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# uv
+uv.lock
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Output
+*.json
+test_output*.txt
